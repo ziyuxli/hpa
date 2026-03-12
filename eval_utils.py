@@ -1,19 +1,37 @@
-import torch
-import torch.nn.functional as F
 import os
 import csv
+from datetime import datetime
 
-def save_rows_to_csv(rows, csv_path):
+import numpy as np
+
+import torch
+import torch.nn.functional as F
+
+from sklearn.linear_model import Ridge
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.multiclass import OneVsRestClassifier
+from sklearn.metrics import accuracy_score, roc_auc_score
+
+
+
+def save_rows_to_csv(rows, csv_path, mode="a"):
+    if not rows:
+        return
     os.makedirs(os.path.dirname(csv_path), exist_ok=True) if os.path.dirname(csv_path) else None
-    write_header = not os.path.exists(csv_path)
+    write_header = mode == "w" or not os.path.exists(csv_path)
 
-    fieldnames = list(rows[0].keys()) if rows else []
-    with open(csv_path, "a", newline="") as f:
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    rows = [{"run_id": run_id, **row} for row in rows]
+
+    fieldnames = list(rows[0].keys())
+    with open(csv_path, mode, newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         if write_header:
             w.writeheader()
-        for r in rows:
-            w.writerow(r)
+        w.writerows(rows)
 
 
 # Linear probe
@@ -55,7 +73,6 @@ def train_linear_probe(X_train, y_train, X_val, y_val, epochs=200, lr=1e-2, wd=0
     return best, best_state
 
 def layerwise_linear_probe(cls_by_layer, targets, train_frac=0.8, seed=0, device="cuda", meta=None, csv_path=None):
-    meta = meta or {}
     N = targets.shape[0]
     g = torch.Generator().manual_seed(seed)
     perm = torch.randperm(N, generator=g)
@@ -74,80 +91,25 @@ def layerwise_linear_probe(cls_by_layer, targets, train_frac=0.8, seed=0, device
         acc, _ = train_linear_probe(X_tr, y_tr, X_va, y_va, device=device)
 
         row = {
-            **meta,
             "eval": "linear_probe",
+            "seed": seed,
             "layer": l,
             "train_frac": train_frac,
-            "seed": seed,
             "val_acc": acc,
         }
         rows.append(row)
         print(f"[Linear probe] layer {l:02d}: val acc = {acc*100:.2f}%")
 
-    if csv_path is not None and len(rows) > 0:
-        save_rows_to_csv(rows, csv_path)
+    if csv_path is not None:
+        rows_to_write = []
+        for row in rows:
+            out_row = {f"meta_{k}": v for k, v in (meta or {}).items()}
+            out_row.update(row)
+            rows_to_write.append(out_row)
+        save_rows_to_csv(rows_to_write, csv_path)
         print("Saved CSV:", csv_path)
 
     return rows
-
-
-
-# knn
-@torch.no_grad()
-def knn_predict(train_X, train_y, test_X, k=20, device="cuda"):
-    train_X = F.normalize(train_X.to(device), dim=1)
-    test_X = F.normalize(test_X.to(device), dim=1)
-    train_y = train_y.to(device)
-
-    sims = test_X @ train_X.T  # [Nte, Ntr]
-    vals, idx = sims.topk(k, dim=1)
-    nn_y = train_y[idx]  # [Nte, k]
-
-    num_classes = int(train_y.max().item() + 1)
-    # similarity-weighted vote
-    votes = torch.zeros(test_X.shape[0], num_classes, device=device)
-    votes.scatter_add_(1, nn_y, vals)
-    return votes.argmax(dim=1).detach().cpu()
-
-@torch.no_grad()
-def layerwise_knn(cls_by_layer, targets, train_frac=0.8, k=20, seed=0, device="cuda",
-                  meta=None, csv_path=None):
-    meta = meta or {}
-    N = targets.shape[0]
-    g = torch.Generator().manual_seed(seed)
-    perm = torch.randperm(N, generator=g)
-
-    n_train = int(train_frac * N)
-    idx_tr = perm[:n_train]
-    idx_te = perm[n_train:]
-
-    y_tr = targets[idx_tr]
-    y_te = targets[idx_te]
-
-    rows = []
-    for l, X in enumerate(cls_by_layer):
-        pred = knn_predict(X[idx_tr], y_tr, X[idx_te], k=k, device=device)
-        acc = (pred == y_te).float().mean().item()
-
-        row = {
-            **meta,
-            "eval": "knn",
-            "layer": l,
-            "train_frac": train_frac,
-            "k": k,
-            "seed": seed,
-            "test_acc": acc,
-        }
-        rows.append(row)
-        print(f"[kNN k={k}] layer {l:02d}: test acc = {acc*100:.2f}%")
-
-    if csv_path is not None and len(rows) > 0:
-        save_rows_to_csv(rows, csv_path)
-        print("Saved CSV:", csv_path)
-
-    return rows
-
-
 
 
 @torch.no_grad()
@@ -197,7 +159,6 @@ def fewshot_knn_episode(X, y, shots=1, k=1, seed=0, device="cpu"):
 @torch.no_grad()
 def layerwise_fewshot_knn(cls_by_layer, targets, shots=1, k=1, episodes=50, seed=0, device="cpu",
                           meta=None, csv_path=None):
-    meta = meta or {}
     targets = targets.cpu()
     rows = []
 
@@ -224,21 +185,309 @@ def layerwise_fewshot_knn(cls_by_layer, targets, shots=1, k=1, episodes=50, seed
               f"acc={mean_acc*100:.2f}% ± {std_acc*100:.2f}%  (episodes={len(accs)})")
 
         row = {
-            **meta,
             "eval": "fewshot_knn",
+            "seed": seed,
             "layer": l,
             "shots": shots,
             "k": k,
             "episodes": episodes,
-            "seed": seed,
             "mean_acc": mean_acc,
             "std_acc": std_acc,
             "total_queries": total_q,
         }
         rows.append(row)
 
-    if csv_path is not None and len(rows) > 0:
-        save_rows_to_csv(rows, csv_path)
+    if csv_path is not None:
+        rows_to_write = []
+        for row in rows:
+            out_row = {f"meta_{k}": v for k, v in (meta or {}).items()}
+            out_row.update(row)
+            rows_to_write.append(out_row)
+        save_rows_to_csv(rows_to_write, csv_path)
         print("Saved CSV:", csv_path)
 
     return rows
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def load_csv(human49_csv):
+    object_to_vec = {}
+    dim_names = None
+
+    with open(human49_csv, "r", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        dim_names = header[1:]
+
+        for row in reader:
+            if not row:
+                continue
+            obj = row[0].strip()
+            vec = np.array([float(x) for x in row[1:]], dtype=np.float32)
+            object_to_vec[obj] = vec
+
+    return object_to_vec, dim_names
+
+
+def layerwise_human49_r2(
+    cls_by_layer,
+    targets,
+    class_id_to_name,
+    human49_csv,
+    test_frac=0.3,
+    seed=42,
+    alpha=1.0,
+    meta=None,
+    csv_path=None,
+):
+    """
+    Evaluate each layer embedding by predicting Human49 vector with object-level split.
+
+    Args:
+        cls_by_layer: list[Tensor], each [N, D]
+        targets: Tensor [N]
+        class_id_to_name: dict[int, str]
+        human49_csv: path to human49.csv
+        test_frac: float
+        seed: int
+        alpha: ridge regularization strength
+        meta: dict
+        csv_path: save per-layer results
+
+    Returns:
+        results: list[dict]
+    """
+    object_to_vec, dim_names = load_csv(human49_csv)
+
+    targets_np = targets.cpu().numpy() if torch.is_tensor(targets) else np.asarray(targets)
+    class_names = [class_id_to_name[int(t)] for t in targets_np]
+
+    Y = np.stack([object_to_vec[name] for name in class_names], axis=0)  # [N, 49]
+
+    # split by object identity, not by image
+    unique_objects = np.array(sorted(set(class_names)))
+    rng = np.random.default_rng(seed)
+    rng.shuffle(unique_objects)
+
+    n_test_obj = max(1, int(round(len(unique_objects) * test_frac)))
+    test_objects = set(unique_objects[:n_test_obj].tolist())
+    train_objects = set(unique_objects[n_test_obj:].tolist())
+
+    train_mask = np.array([name in train_objects for name in class_names], dtype=bool)
+    test_mask = np.array([name in test_objects for name in class_names], dtype=bool)
+
+    results = []
+
+    for layer_idx, feats in enumerate(cls_by_layer):
+        X = feats.cpu().numpy() if torch.is_tensor(feats) else np.asarray(feats)
+
+        X_train = X[train_mask]
+        Y_train = Y[train_mask]
+        X_test = X[test_mask]
+        Y_test = Y[test_mask]
+
+        # Standardize X, then ridge regression for multi-output prediction
+        reg = make_pipeline(StandardScaler(),Ridge(alpha=alpha))
+        reg.fit(X_train, Y_train)
+        Y_pred = reg.predict(X_test)
+
+        # overall multioutput r2
+        r2_uniform = r2_score(Y_test, Y_pred, multioutput="uniform_average")
+        r2_variance_weighted = r2_score(Y_test, Y_pred, multioutput="variance_weighted")
+
+        # per-dimension r2
+        per_dim_r2 = r2_score(Y_test, Y_pred, multioutput="raw_values")
+        per_dim_r2 = np.asarray(per_dim_r2, dtype=np.float64)
+
+        row = {
+            "eval": "human49_r2",
+            "seed": int(seed),
+            "layer": layer_idx,
+            "r2_uniform_avg": float(r2_uniform),
+            "r2_variance_weighted": float(r2_variance_weighted),
+            "r2_dim_mean": float(np.mean(per_dim_r2)),
+            "r2_dim_median": float(np.median(per_dim_r2)),
+            "n_train_images": int(train_mask.sum()),
+            "n_test_images": int(test_mask.sum()),
+            "n_train_objects": int(len(train_objects)),
+            "n_test_objects": int(len(test_objects)),
+            "ridge_alpha": float(alpha),
+        }
+
+        results.append(row)
+
+        print(
+            f"[Human49 R2] layer={layer_idx:02d} | "
+            f"R2(uniform)={r2_uniform:.4f} | "
+            f"R2(var_weighted)={r2_variance_weighted:.4f}"
+        )
+
+    if csv_path is not None:
+        rows_to_write = []
+        for row in results:
+            out_row = {f"meta_{k}": v for k, v in (meta or {}).items()}
+            out_row.update(row)
+            rows_to_write.append(out_row)
+        save_rows_to_csv(rows_to_write, csv_path)
+        print(f"Saved CSV: {csv_path}")
+
+    return results
+
+
+
+
+
+
+
+
+
+
+def layerwise_supercategory_prediction(
+    cls_by_layer,
+    targets,
+    class_id_to_name,
+    supercategory_csv,
+    test_frac=0.3,
+    seed=42,
+    C=1.0,
+    max_iter=1000,
+    meta=None,
+    csv_path=None,
+):
+    object_to_attr, attr_names = load_csv(supercategory_csv)
+
+    targets_np = targets.cpu().numpy() if torch.is_tensor(targets) else np.asarray(targets)
+    class_names = [class_id_to_name[int(t)] for t in targets_np]
+
+    Y = np.stack([object_to_attr[name] for name in class_names], axis=0)  # [N, K]
+    Y = Y.astype(np.float32)
+
+    unique_objects = np.array(sorted(set(class_names)))
+    rng = np.random.default_rng(seed)
+    rng.shuffle(unique_objects)
+
+    n_test_obj = max(1, int(round(len(unique_objects) * test_frac)))
+    test_objects = set(unique_objects[:n_test_obj].tolist())
+    train_objects = set(unique_objects[n_test_obj:].tolist())
+
+    train_mask = np.array([name in train_objects for name in class_names], dtype=bool)
+    test_mask = np.array([name in test_objects for name in class_names], dtype=bool)
+
+    Y_train = Y[train_mask]
+    Y_test = Y[test_mask]
+
+    # keep only supercategorys that are not constant in training
+    train_pos = Y_train.sum(axis=0)
+    train_neg = Y_train.shape[0] - train_pos
+    valid_train_cols = (train_pos > 0) & (train_neg > 0)
+
+    if valid_train_cols.sum() == 0:
+        raise ValueError("All supercategorys are constant in training split. Cannot train classifiers.")
+
+    Y_train_valid = Y_train[:, valid_train_cols]
+    Y_test_valid = Y_test[:, valid_train_cols]
+    valid_attr_names = [attr_names[i] for i in range(len(attr_names)) if valid_train_cols[i]]
+
+    results = []
+
+    for layer_idx, feats in enumerate(cls_by_layer):
+        X = feats.cpu().numpy() if torch.is_tensor(feats) else np.asarray(feats)
+
+        X_train = X[train_mask]
+        X_test = X[test_mask]
+
+        clf = make_pipeline(
+            StandardScaler(),
+            OneVsRestClassifier(
+                LogisticRegression(
+                    C=C,
+                    penalty="l2",
+                    solver="liblinear",
+                    max_iter=max_iter,
+                    random_state=seed,
+                )
+            )
+        )
+        clf.fit(X_train, Y_train_valid)
+
+        # probability for positive class
+        Y_score = clf.predict_proba(X_test)  # [N_test, K_valid]
+
+        # AP can work even if some test labels are all-0 or all-1, but macro over such labels is not ideal.
+        # ROC-AUC requires both classes in test, so we filter again for test-valid labels.
+        test_pos = Y_test_valid.sum(axis=0)
+        test_neg = Y_test_valid.shape[0] - test_pos
+        valid_test_cols = (test_pos > 0) & (test_neg > 0)
+
+        Y_pred = (Y_score > 0.5).astype(int)
+
+        # accuracy
+        acc = accuracy_score(
+            Y_test_valid.flatten(),
+            Y_pred.flatten()
+        )
+
+        # AUC
+        if valid_test_cols.sum() > 0:
+            auc = roc_auc_score(
+                Y_test_valid[:, valid_test_cols],
+                Y_score[:, valid_test_cols],
+                average="macro"
+            )
+        else:
+            auc = np.nan
+
+        row = {
+            "eval": "supercategory",
+            "seed": int(seed),
+            "layer": layer_idx,
+            "acc": float(acc),
+            "auc": float(auc),
+            "n_train_images": int(train_mask.sum()),
+            "n_test_images": int(test_mask.sum()),
+            "n_train_objects": int(len(train_objects)),
+            "n_test_objects": int(len(test_objects)),
+            "n_total_supercategorys": int(Y.shape[1]),
+            "n_train_valid_supercategorys": int(valid_train_cols.sum()),
+            "logreg_C": float(C),
+            "max_iter": int(max_iter),
+        }
+        results.append(row)
+
+        auc_str = f"{auc:.4f}" if not np.isnan(auc) else "nan"
+
+        print(
+            f"[Attribute Eval] layer={layer_idx:02d} | "
+            f"ACC={acc:.4f} | "
+            f"AUC={auc_str}"
+        )
+
+    if csv_path is not None:
+        rows_to_write = []
+        for row in results:
+            out_row = {f"meta_{k}": v for k, v in (meta or {}).items()}
+            out_row.update(row)
+            rows_to_write.append(out_row)
+        save_rows_to_csv(rows_to_write, csv_path)
+        print(f"Saved CSV: {csv_path}")
+
+    return results
