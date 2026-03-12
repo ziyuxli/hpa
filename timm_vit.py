@@ -13,7 +13,7 @@ import timm
 from timm.data import resolve_data_config
 from timm.data.transforms_factory import create_transform
 
-from eval_utils import layerwise_knn, layerwise_linear_probe, layerwise_fewshot_knn
+from eval_utils import layerwise_linear_probe, layerwise_fewshot_knn, layerwise_human49_r2, layerwise_supercategory_prediction
 
 
 def build_loader(data_root: str, model, batch_size: int, num_workers: int):
@@ -109,18 +109,18 @@ def run(args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_root", type=str, default="data_test/object_images_eval")
-    ap.add_argument("--model", type=str, default="vit_base_patch16_224")
+    ap.add_argument("--model", type=str, default="vit_base_patch16_clip_224.openai")
     ap.add_argument("--batch", type=int, default=128)
-    ap.add_argument("--num_workers", type=int, default=8)
+    ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--out", type=str, default="things_vitb16_intermediates.pt")
-    ap.add_argument("--eval_dir", type=str, default="eval_csv")
+    ap.add_argument("--eval_dir", type=str, default="eval_csv_test")
     ap.add_argument("--shots", type=int, default=1)
     ap.add_argument("--knn_k", type=int, default=5)
     ap.add_argument("--episodes", type=int, default=100)
     ap.add_argument("--train_frac", type=float, default=0.8)
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
     out_obj = run(args)
@@ -135,10 +135,9 @@ def main():
     targets = out_obj["targets"]
     cls_by_layer = out_obj["cls_by_layer"]
 
-    # 统一 meta（每行都会带上这些信息）
+    # meta information for evluation
     meta = {
         "model": args.model,
-        "data_root": args.data_root,
         "N": out_obj["shape"]["N"],
         "L": out_obj["shape"]["L"],
         "D": out_obj["shape"]["D"],
@@ -147,15 +146,7 @@ def main():
 
     eval_device = "cuda" if torch.cuda.is_available() and args.device == "cuda" else "cpu"
 
-    # 1) layerwise knn
-    layerwise_knn(
-        cls_by_layer, targets,
-        train_frac=args.train_frac, k=args.knn_k, seed=args.seed, device=eval_device,
-        meta=meta,
-        csv_path=os.path.join(args.eval_dir, "knn.csv"),
-    )
-
-    # 2) few-shot knn
+    # 1) few-shot knn
     layerwise_fewshot_knn(
         cls_by_layer, targets,
         shots=args.shots, k=args.knn_k, episodes=args.episodes, seed=args.seed, device=eval_device,
@@ -163,7 +154,7 @@ def main():
         csv_path=os.path.join(args.eval_dir, "fewshot_knn.csv"),
     )
 
-
+    # 2) linear_probe 1854 way classification test
     layerwise_linear_probe(
         cls_by_layer, targets,
         train_frac=args.train_frac, seed=args.seed, device=eval_device,
@@ -171,10 +162,36 @@ def main():
         csv_path=os.path.join(args.eval_dir, "linear_probe.csv"),
     )
 
+    # 3) human49 regression with object-level 7:3 split
+    layerwise_human49_r2(
+        cls_by_layer=cls_by_layer,
+        targets=targets,
+        class_id_to_name=out_obj["class_id_to_name"],
+        human49_csv="data/human49.csv",
+        test_frac=0.3,
+        seed=args.seed,
+        alpha=1.0,
+        meta=meta,
+        csv_path=os.path.join(args.eval_dir, "human49_r2.csv"),
+    )
 
-    # save embedding resultj
-    torch.save(out_obj, args.out)
-    print("Saved:", args.out)
+
+    # 4) supercategory prediction
+    layerwise_supercategory_prediction(
+        cls_by_layer=cls_by_layer,
+        targets=targets,
+        class_id_to_name=out_obj["class_id_to_name"],
+        supercategory_csv="data/category.csv",
+        test_frac=0.3,
+        seed=args.seed,
+        meta=meta,
+        csv_path=os.path.join(args.eval_dir, "supercategory_prediction.csv"),
+    )
+
+
+    # # save embedding resultj
+    # torch.save(out_obj, args.out)
+    # print("Saved:", args.out)
 
 
 if __name__ == "__main__":
